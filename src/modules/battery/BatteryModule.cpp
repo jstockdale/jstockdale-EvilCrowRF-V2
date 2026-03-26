@@ -2,7 +2,7 @@
  * @file BatteryModule.cpp
  * @brief Battery voltage monitoring implementation.
  *
- * Uses ESP-IDF 5.x ADC oneshot + calibration API for accurate readings.
+ * Uses legacy ESP-IDF 4.4 ADC driver (driver/adc.h + esp_adc_cal.h).
  * GPIO 36 (VP) is an input-only pin with ADC1_CHANNEL_0.
  *
  * LiPo discharge curve approximation (3.7V nominal):
@@ -21,64 +21,59 @@
 
 static const char* TAG = "Battery";
 
+// Default reference voltage (mV) used when eFuse Vref is not burned
+static constexpr uint32_t DEFAULT_VREF = 1100;
+
 // Static members
 bool     BatteryModule::initialized_  = false;
 uint16_t BatteryModule::lastVoltage_  = 0;
 uint8_t  BatteryModule::lastPercent_  = 0;
 bool     BatteryModule::lastCharging_ = false;
-adc_oneshot_unit_handle_t BatteryModule::adcHandle_ = nullptr;
-adc_cali_handle_t         BatteryModule::caliHandle_ = nullptr;
+bool     BatteryModule::calibrated_   = false;
+esp_adc_cal_characteristics_t BatteryModule::adcChars_ = {};
 TimerHandle_t BatteryModule::readTimer_ = nullptr;
 
 void BatteryModule::init() {
     if (initialized_) return;
 
-    // ── ADC oneshot unit init ───────────────────────────────────
-    adc_oneshot_unit_init_cfg_t unitCfg = {};
-    unitCfg.unit_id = ADC_UNIT_1;
-    unitCfg.ulp_mode = ADC_ULP_MODE_DISABLE;
-
-    esp_err_t err = adc_oneshot_new_unit(&unitCfg, &adcHandle_);
+    // ── ADC1 width config (12-bit) ──────────────────────────────
+    esp_err_t err = adc1_config_width(ADC_WIDTH_BIT_12);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to init ADC unit: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to config ADC width: %s", esp_err_to_name(err));
         return;
     }
 
-    // ── Channel config (GPIO 36 = ADC1_CH0, 12dB attenuation for ~3.3V range) ──
-    adc_oneshot_chan_cfg_t chanCfg = {};
-    chanCfg.atten = ADC_ATTEN_DB_12;
-    chanCfg.bitwidth = ADC_BITWIDTH_12;
-
-    err = adc_oneshot_config_channel(adcHandle_, ADC_CHANNEL_0, &chanCfg);
+    // ── Channel attenuation (GPIO 36 = ADC1_CH0, 12dB for ~0-3.3V) ──
+    err = adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to config ADC channel: %s", esp_err_to_name(err));
-        adc_oneshot_del_unit(adcHandle_);
-        adcHandle_ = nullptr;
+        ESP_LOGE(TAG, "Failed to config ADC channel atten: %s", esp_err_to_name(err));
         return;
     }
 
-    // ── Calibration (line fitting scheme for original ESP32) ────
-    //
-    // ESP32 supports line fitting calibration.
-    // Uses factory eFuse Vref or Two-Point values if available.
-#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
-    adc_cali_line_fitting_config_t caliCfg = {};
-    caliCfg.unit_id  = ADC_UNIT_1;
-    caliCfg.atten    = ADC_ATTEN_DB_12;
-    caliCfg.bitwidth = ADC_BITWIDTH_12;
+    // ── Calibration characterization ────────────────────────────
+    // Check what calibration values are burned into eFuse
+    esp_adc_cal_value_t calType = esp_adc_cal_characterize(
+        ADC_UNIT_1,
+        ADC_ATTEN_DB_12,
+        ADC_WIDTH_BIT_12,
+        DEFAULT_VREF,
+        &adcChars_
+    );
 
-    err = adc_cali_create_scheme_line_fitting(&caliCfg, &caliHandle_);
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG, "ADC calibration: line fitting");
-    } else {
-        ESP_LOGW(TAG, "ADC calibration failed (%s), using raw readings",
-                 esp_err_to_name(err));
-        caliHandle_ = nullptr;
+    switch (calType) {
+        case ESP_ADC_CAL_VAL_EFUSE_TP:
+            ESP_LOGI(TAG, "ADC calibration: Two Point (eFuse)");
+            calibrated_ = true;
+            break;
+        case ESP_ADC_CAL_VAL_EFUSE_VREF:
+            ESP_LOGI(TAG, "ADC calibration: Vref (eFuse)");
+            calibrated_ = true;
+            break;
+        default:
+            ESP_LOGW(TAG, "ADC calibration: default Vref (%lumV)", DEFAULT_VREF);
+            calibrated_ = true;  // Still usable, just less accurate
+            break;
     }
-#else
-    ESP_LOGW(TAG, "ADC line fitting not supported, using raw readings");
-    caliHandle_ = nullptr;
-#endif
 
     // Take initial reading
     lastVoltage_ = readVoltage();
@@ -107,24 +102,17 @@ void BatteryModule::init() {
 }
 
 uint16_t BatteryModule::readVoltage() {
-    if (!adcHandle_) return 0;
-
     // Multisample for noise reduction
     uint32_t rawSum = 0;
     for (int i = 0; i < ADC_SAMPLES; i++) {
-        int raw = 0;
-        if (adc_oneshot_read(adcHandle_, ADC_CHANNEL_0, &raw) == ESP_OK) {
-            rawSum += raw;
-        }
+        rawSum += adc1_get_raw(ADC1_CHANNEL_0);
     }
     int rawAvg = (int)(rawSum / ADC_SAMPLES);
 
-    // Convert to calibrated millivolts if calibration is available
+    // Convert to calibrated millivolts
     uint32_t voltage_mv;
-    if (caliHandle_) {
-        int mv = 0;
-        adc_cali_raw_to_voltage(caliHandle_, rawAvg, &mv);
-        voltage_mv = (uint32_t)mv;
+    if (calibrated_) {
+        voltage_mv = esp_adc_cal_raw_to_voltage(rawAvg, &adcChars_);
     } else {
         // Fallback: approximate conversion for 12-bit / 12dB atten
         // Full range ~3300mV over 4095 counts

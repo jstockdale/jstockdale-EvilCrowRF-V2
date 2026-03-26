@@ -18,6 +18,7 @@
 
 #include "modules/CC1101_driver/CC1101_Worker.h"
 #include "CC1101_Radio.h"
+#include "core/serial/LogGate.h"
 #include <cstring>
 
 static const char* TAG = "SDR";
@@ -48,21 +49,14 @@ void SdrModule::init() {
 
 bool SdrModule::enable(int module) {
     if (active_) {
-        ESP_LOGW(TAG, "SDR mode already active");
         return true;
     }
 
-    // Validate module index
     if (module < 0 || module >= CC1101_NUM_MODULES) {
-        ESP_LOGE(TAG, "Invalid CC1101 module index: %d", module);
         return false;
     }
-
-    // Check that the target module is idle (not doing other work)
     CC1101State currentState = CC1101Worker::getState(module);
     if (currentState != CC1101State::Idle) {
-        ESP_LOGE(TAG, "CC1101 module %d is busy (state=%d), cannot enter SDR mode",
-                 module, (int)currentState);
         return false;
     }
 
@@ -72,14 +66,9 @@ bool SdrModule::enable(int module) {
     subMode_ = SdrSubMode::Idle;
     streamSeqNum_ = 0;
     totalBytesStreamed_ = 0;
-
-    // Put the CC1101 module in idle mode
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
-
+    // NOTE: Do NOT wrap this in getSpiSemaphore() — setSidle() takes
+    // the same mutex internally with portMAX_DELAY, which would deadlock.
+    moduleCC1101State[sdrModule_].setSidle();
     ESP_LOGI(TAG, "SDR mode ENABLED on module %d", sdrModule_);
     sendStatus();
     return true;
@@ -97,15 +86,14 @@ bool SdrModule::disable() {
     }
 
     // Put module back in idle
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
+    // NOTE: Do NOT wrap in getSpiSemaphore() — setSidle() handles its own mutex.
+    moduleCC1101State[sdrModule_].setSidle();
 
     active_ = false;
     subMode_ = SdrSubMode::Idle;
 
+    // Restore ESP_LOG output now that text protocol is no longer active
+    LogGate::restore();
     ESP_LOGI(TAG, "SDR mode DISABLED");
     sendStatus();
     return true;
@@ -142,69 +130,47 @@ bool SdrModule::setFrequency(float freqMHz) {
         return false;
     }
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].changeFrequency(freqMHz);
-        currentFreqMHz_ = freqMHz;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Frequency set to %.3f MHz", freqMHz);
-        return true;
-    }
-
-    ESP_LOGE(TAG, "Failed to acquire SPI mutex for setFrequency");
-    return false;
+    // changeFrequency() handles its own SPI mutex internally
+    moduleCC1101State[sdrModule_].changeFrequency(freqMHz);
+    currentFreqMHz_ = freqMHz;
+    return true;
 }
 
 bool SdrModule::setModulation(int mod) {
     if (!active_) return false;
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        // Apply modulation via full config (keeps other settings)
-        moduleCC1101State[sdrModule_].setConfig(
-            MODE_RECEIVE, currentFreqMHz_, true, mod,
-            currentBandwidthKHz_, 1.58f, currentDataRate_);
-        moduleCC1101State[sdrModule_].initConfig();
-        currentModulation_ = mod;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Modulation set to %d", mod);
-        return true;
-    }
-    return false;
+    // setConfig() just updates the config struct (no mutex).
+    // initConfig() handles its own SPI mutex internally.
+    moduleCC1101State[sdrModule_].setConfig(
+        MODE_RECEIVE, currentFreqMHz_, true, mod,
+        currentBandwidthKHz_, 1.58f, currentDataRate_);
+    moduleCC1101State[sdrModule_].initConfig();
+    currentModulation_ = mod;
+    return true;
 }
 
 bool SdrModule::setBandwidth(float bwKHz) {
     if (!active_) return false;
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setReceiveConfig(
-            currentFreqMHz_, true, currentModulation_,
-            bwKHz, 1.58f, currentDataRate_);
-        moduleCC1101State[sdrModule_].initConfig();
-        currentBandwidthKHz_ = bwKHz;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Bandwidth set to %.1f kHz", bwKHz);
-        return true;
-    }
-    return false;
+    // setReceiveConfig() just updates config struct (no mutex).
+    // initConfig() handles its own SPI mutex internally.
+    moduleCC1101State[sdrModule_].setReceiveConfig(
+        currentFreqMHz_, true, currentModulation_,
+        bwKHz, 1.58f, currentDataRate_);
+    moduleCC1101State[sdrModule_].initConfig();
+    currentBandwidthKHz_ = bwKHz;
+    return true;
 }
 
 bool SdrModule::setDataRate(float rate) {
     if (!active_) return false;
 
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setReceiveConfig(
-            currentFreqMHz_, true, currentModulation_,
-            currentBandwidthKHz_, 1.58f, rate);
-        moduleCC1101State[sdrModule_].initConfig();
-        currentDataRate_ = rate;
-        xSemaphoreGive(spiMutex);
-        ESP_LOGI(TAG, "Data rate set to %.2f kBaud", rate);
-        return true;
-    }
-    return false;
+    moduleCC1101State[sdrModule_].setReceiveConfig(
+        currentFreqMHz_, true, currentModulation_,
+        currentBandwidthKHz_, 1.58f, rate);
+    moduleCC1101State[sdrModule_].initConfig();
+    currentDataRate_ = rate;
+    return true;
 }
 
 // ── RSSI reading ────────────────────────────────────────────────────
@@ -237,8 +203,6 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
         return 0;
     }
 
-    ESP_LOGI(TAG, "Spectrum scan: %.2f-%.2f MHz, step=%.3f MHz, %d points",
-             config.startFreqMHz, config.endFreqMHz, config.stepMHz, totalPoints);
 
     // Chunk size for BLE transmission (limited by BLE MTU ~120 bytes usable)
     const int chunkSize = 60;  // RSSI values per chunk
@@ -260,30 +224,22 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
         if (!isValidFrequency(freq)) {
             rssiBuffer[bufferIdx++] = -128;  // Mark as invalid
         } else {
-            if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
-                // Set frequency
-                moduleCC1101State[sdrModule_].changeFrequency(freq);
+            // changeFrequency() handles its own mutex — call OUTSIDE any lock
+            moduleCC1101State[sdrModule_].changeFrequency(freq);
 
-                // Enter RX mode for RSSI measurement
+            // Raw cc1101 calls need the external mutex
+            if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
                 cc1101.setModul(sdrModule_);
                 cc1101.SetRx(freq);
-
                 xSemaphoreGive(spiMutex);
-
-                // Wait for RSSI to settle
-                delayMicroseconds(SDR_RSSI_SETTLE_US);
-
-                // Read RSSI (thread-safe via SPI semaphore inside getRssi)
-                if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(50))) {
-                    int rssi = moduleCC1101State[sdrModule_].getRssi();
-                    rssiBuffer[bufferIdx++] = (int8_t)constrain(rssi, -128, 0);
-                    xSemaphoreGive(spiMutex);
-                } else {
-                    rssiBuffer[bufferIdx++] = -128;
-                }
-            } else {
-                rssiBuffer[bufferIdx++] = -128;
             }
+
+            // Wait for RSSI to settle
+            delayMicroseconds(SDR_RSSI_SETTLE_US);
+
+            // getRssi() handles its own mutex — call OUTSIDE any lock
+            int rssi = moduleCC1101State[sdrModule_].getRssi();
+            rssiBuffer[bufferIdx++] = (int8_t)constrain(rssi, -128, 0);
         }
 
         pointsScanned++;
@@ -306,14 +262,10 @@ int SdrModule::spectrumScan(const SpectrumScanConfig& config) {
         }
     }
 
-    // Return to idle after scan
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
+    // setSidle() handles its own mutex — call OUTSIDE any lock
+    moduleCC1101State[sdrModule_].setSidle();
 
     subMode_ = SdrSubMode::Idle;
-    ESP_LOGI(TAG, "Spectrum scan complete: %d points", pointsScanned);
     return pointsScanned;
 }
 
@@ -330,18 +282,18 @@ bool SdrModule::startRawRx() {
         return true;
     }
 
+    // setReceiveConfig() just updates config struct (no mutex).
+    // initConfig() handles its own SPI mutex internally.
+    moduleCC1101State[sdrModule_].setReceiveConfig(
+        currentFreqMHz_, true, currentModulation_,
+        currentBandwidthKHz_, 1.58f, currentDataRate_);
+    moduleCC1101State[sdrModule_].initConfig();
+
+    // Raw cc1101 calls need external mutex
     SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
     if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        // Configure CC1101 for RX at current frequency
-        moduleCC1101State[sdrModule_].setReceiveConfig(
-            currentFreqMHz_, true, currentModulation_,
-            currentBandwidthKHz_, 1.58f, currentDataRate_);
-        moduleCC1101State[sdrModule_].initConfig();
-
-        // Enter RX mode
         cc1101.setModul(sdrModule_);
         cc1101.SetRx(currentFreqMHz_);
-
         xSemaphoreGive(spiMutex);
     } else {
         ESP_LOGE(TAG, "Failed to acquire SPI mutex for startRawRx");
@@ -353,8 +305,6 @@ bool SdrModule::startRawRx() {
     totalBytesStreamed_ = 0;
     subMode_ = SdrSubMode::RawRx;
 
-    ESP_LOGI(TAG, "Raw RX started at %.3f MHz, mod=%d, bw=%.0f kHz",
-             currentFreqMHz_, currentModulation_, currentBandwidthKHz_);
     return true;
 }
 
@@ -364,14 +314,9 @@ void SdrModule::stopRawRx() {
     streaming_ = false;
     subMode_ = SdrSubMode::Idle;
 
-    // Put CC1101 back to idle
-    SemaphoreHandle_t spiMutex = ModuleCc1101::getSpiSemaphore();
-    if (xSemaphoreTake(spiMutex, pdMS_TO_TICKS(100))) {
-        moduleCC1101State[sdrModule_].setSidle();
-        xSemaphoreGive(spiMutex);
-    }
+    // setSidle() handles its own SPI mutex internally
+    moduleCC1101State[sdrModule_].setSidle();
 
-    ESP_LOGI(TAG, "Raw RX stopped. Total bytes streamed: %u", totalBytesStreamed_);
 }
 
 void SdrModule::pollRawRx() {
@@ -419,7 +364,16 @@ void SdrModule::pollRawRx() {
     }
 }
 
-// ── Serial SDR command interface (HackRF-compatible) ────────────────
+// ── Serial SDR command interface ─────────────────────────────────────
+//
+// Protocol convention:
+//   - Content/data lines come FIRST
+//   - HACKRF_SUCCESS or HACKRF_ERROR is always the LAST line (sentinel)
+//   - Python's send_command() reads until it sees the sentinel
+//
+// Note: "HACKRF_" prefix is a naming convention borrowed from HackRF
+// for familiarity.  The actual HackRF uses a USB binary protocol;
+// this text-over-serial protocol is custom to EvilCrow RF v2.
 
 bool SdrModule::processSerialCommand(const String& command) {
     String cmd = command;
@@ -427,37 +381,42 @@ bool SdrModule::processSerialCommand(const String& command) {
 
     // ── Bootstrap commands (work even when SDR is NOT active) ──────
 
-    // sdr_enable — enable SDR mode via serial (no app/BLE needed)
+    // sdr_enable
     if (cmd.equalsIgnoreCase("sdr_enable")) {
         if (active_) {
-            Serial.println("HACKRF_SUCCESS");
             Serial.println("SDR mode already active");
+            Serial.println("HACKRF_SUCCESS");
         } else {
             if (enable()) {
-                Serial.println("HACKRF_SUCCESS");
                 Serial.println("SDR mode enabled via serial");
+                Serial.println("HACKRF_SUCCESS");
             } else {
-                Serial.println("HACKRF_ERROR");
                 Serial.println("Failed to enable SDR mode (CC1101 may be busy)");
+                Serial.println("HACKRF_ERROR");
             }
+        }
+        // Suppress ESP_LOG AFTER response is fully transmitted
+        if (active_) {
+            Serial.flush();
+            LogGate::suppress();
         }
         return true;
     }
 
-    // sdr_disable — disable SDR mode via serial
+    // sdr_disable
     if (cmd.equalsIgnoreCase("sdr_disable")) {
+        LogGate::restore();
         if (disable()) {
-            Serial.println("HACKRF_SUCCESS");
             Serial.println("SDR mode disabled");
+            Serial.println("HACKRF_SUCCESS");
         } else {
             Serial.println("HACKRF_ERROR");
         }
         return true;
     }
 
-    // sdr_info — show CC1101 SDR parameter limits (always available)
+    // sdr_info
     if (cmd.equalsIgnoreCase("sdr_info")) {
-        Serial.println("HACKRF_SUCCESS");
         Serial.println("=== EvilCrow RF v2 SDR — CC1101 Parameter Limits ===");
         Serial.println("Frequency bands:");
         Serial.println("  Band 1: 300.000 - 348.000 MHz");
@@ -472,107 +431,103 @@ bool SdrModule::processSerialCommand(const String& command) {
         Serial.printf("Current: %.3f MHz, mod=%d, bw=%.0f kHz, rate=%.2f kBaud\n",
                        currentFreqMHz_, currentModulation_,
                        currentBandwidthKHz_, currentDataRate_);
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
-    // board_id_read — identify as EvilCrow SDR (works always)
+    // board_id_read
     if (cmd.equalsIgnoreCase("board_id_read")) {
-        Serial.println("HACKRF_SUCCESS");
         Serial.println("Board ID: EvilCrow_RF_v2_SDR");
         Serial.printf("Frequency: %.3f MHz\n", currentFreqMHz_);
         Serial.printf("Module: %d\n", sdrModule_);
         Serial.printf("SDR Active: %s\n", active_ ? "YES" : "NO");
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
-    // set_freq <Hz> — set center frequency
+    // set_freq <Hz>
     if (cmd.startsWith("set_freq ")) {
         uint64_t freqHz = strtoull(cmd.substring(9).c_str(), nullptr, 10);
         float freqMHz = freqHz / 1000000.0f;
         if (setFrequency(freqMHz)) {
-            Serial.println("HACKRF_SUCCESS");
             Serial.printf("Frequency: %.3f MHz\n", currentFreqMHz_);
+            Serial.println("HACKRF_SUCCESS");
         } else {
-            Serial.println("HACKRF_ERROR");
             Serial.println("Invalid frequency (CC1101 range: 300-348, 387-464, 779-928 MHz)");
+            Serial.println("HACKRF_ERROR");
         }
         return true;
     }
 
-    // set_sample_rate <Hz> — maps to CC1101 data rate
+    // set_sample_rate <Hz>
     if (cmd.startsWith("set_sample_rate ")) {
         uint32_t rate = cmd.substring(16).toInt();
-        // CC1101 data rate range: 0.6–500 kBaud
         float kBaud = rate / 1000.0f;
         if (kBaud >= 0.6f && kBaud <= 500.0f) {
             setDataRate(kBaud);
-            Serial.println("HACKRF_SUCCESS");
             Serial.printf("Data rate: %.2f kBaud\n", kBaud);
+            Serial.println("HACKRF_SUCCESS");
         } else {
-            Serial.println("HACKRF_ERROR");
             Serial.println("Rate out of range (600 - 500000 Baud)");
+            Serial.println("HACKRF_ERROR");
         }
         return true;
     }
 
-    // set_gain <dB> — maps to CC1101 LNA setting (limited)
+    // set_gain <dB>
     if (cmd.startsWith("set_gain ")) {
         int gain = cmd.substring(9).toInt();
-        // CC1101 gain is controlled via AGC, not directly settable as dB
-        // We acknowledge the command for compatibility but log a note
-        ESP_LOGI(TAG, "Gain set request: %d dB (CC1101 uses AGC, limited control)", gain);
-        Serial.println("HACKRF_SUCCESS");
         Serial.printf("Gain: %d dB (CC1101 AGC mode)\n", gain);
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
-    // set_bandwidth <kHz> — set RX bandwidth
+    // set_bandwidth <kHz>
     if (cmd.startsWith("set_bandwidth ")) {
         float bw = cmd.substring(14).toFloat();
         if (setBandwidth(bw)) {
-            Serial.println("HACKRF_SUCCESS");
             Serial.printf("Bandwidth: %.1f kHz\n", bw);
+            Serial.println("HACKRF_SUCCESS");
         } else {
             Serial.println("HACKRF_ERROR");
         }
         return true;
     }
 
-    // set_modulation <type> — 0=2FSK, 2=ASK/OOK
+    // set_modulation <type>
     if (cmd.startsWith("set_modulation ")) {
         int mod = cmd.substring(15).toInt();
         if (setModulation(mod)) {
-            Serial.println("HACKRF_SUCCESS");
             Serial.printf("Modulation: %d\n", mod);
+            Serial.println("HACKRF_SUCCESS");
         } else {
             Serial.println("HACKRF_ERROR");
         }
         return true;
     }
 
-    // rx_start — start raw RX streaming via serial
+    // rx_start
     if (cmd.equalsIgnoreCase("rx_start")) {
         if (startRawRx()) {
-            Serial.println("HACKRF_SUCCESS");
             Serial.println("RX streaming started");
+            Serial.println("HACKRF_SUCCESS");
         } else {
             Serial.println("HACKRF_ERROR");
         }
         return true;
     }
 
-    // rx_stop — stop raw RX streaming
+    // rx_stop
     if (cmd.equalsIgnoreCase("rx_stop")) {
         stopRawRx();
-        Serial.println("HACKRF_SUCCESS");
         Serial.println("RX streaming stopped");
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
     // spectrum_scan [start_mhz] [end_mhz] [step_khz]
     if (cmd.startsWith("spectrum_scan")) {
         SpectrumScanConfig scanCfg;
-        // Parse optional parameters
         int firstSpace = cmd.indexOf(' ');
         if (firstSpace > 0) {
             String params = cmd.substring(firstSpace + 1);
@@ -590,28 +545,29 @@ bool SdrModule::processSerialCommand(const String& command) {
                 scanCfg.startFreqMHz = params.toFloat();
             }
         }
-        Serial.println("HACKRF_SUCCESS");
         Serial.printf("Scanning %.2f - %.2f MHz (step %.3f MHz)...\n",
                        scanCfg.startFreqMHz, scanCfg.endFreqMHz, scanCfg.stepMHz);
         int points = spectrumScan(scanCfg);
         Serial.printf("Scan complete: %d points\n", points);
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
-    // sdr_status — get current status
+    // sdr_status
     if (cmd.equalsIgnoreCase("sdr_status")) {
-        Serial.println("HACKRF_SUCCESS");
         Serial.printf("Active: %s\n", active_ ? "YES" : "NO");
         Serial.printf("Mode: %d\n", (int)subMode_);
         Serial.printf("Frequency: %.3f MHz\n", currentFreqMHz_);
         Serial.printf("Modulation: %d\n", currentModulation_);
         Serial.printf("Bandwidth: %.1f kHz\n", currentBandwidthKHz_);
+        Serial.printf("Data rate: %.2f kBaud\n", currentDataRate_);
         Serial.printf("Streaming: %s\n", streaming_ ? "YES" : "NO");
         Serial.printf("Bytes streamed: %u\n", totalBytesStreamed_);
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
-    // help — list available commands
+    // help
     if (cmd.equalsIgnoreCase("help") || cmd.equalsIgnoreCase("?")) {
         Serial.println("EvilCrow RF v2 SDR Commands:");
         Serial.println("  sdr_enable                 — Enable SDR mode (no app needed)");
@@ -628,11 +584,13 @@ bool SdrModule::processSerialCommand(const String& command) {
         Serial.println("  spectrum_scan [s] [e] [st]  — Scan spectrum (MHz)");
         Serial.println("  sdr_status                 — Show status");
         Serial.println("  help                       — This help");
+        Serial.println("HACKRF_SUCCESS");
         return true;
     }
 
-    return false;  // Command not recognized
+    return false;
 }
+
 
 // ── BLE notification helpers ────────────────────────────────────────
 

@@ -3,13 +3,15 @@
  * @brief Battery voltage monitoring via ADC for EvilCrow-RF-V2.
  *
  * Reads battery voltage through a voltage divider on GPIO 36 (VP).
- * Typical hardware: LiPo 1000mAh with R1=100K/R2=100K divider.
+ * Typical hardware: LiPo 1000mAh with R1=220K/R2=100K divider.
  *
  * Features:
  *   - Periodic ADC reading with averaging (multisampling)
  *   - Voltage-to-percentage conversion (linear LiPo curve approximation)
  *   - BLE notification (MSG_BATTERY_STATUS = 0xC3)
  *   - FreeRTOS timer for background monitoring
+ *
+ * Uses legacy ESP-IDF 4.4 ADC driver (driver/adc.h + esp_adc_cal.h).
  */
 
 #ifndef BATTERY_MODULE_H
@@ -21,9 +23,8 @@
 
 #if BATTERY_MODULE_ENABLED
 
-#include <esp_adc/adc_oneshot.h>
-#include <esp_adc/adc_cali.h>
-#include <esp_adc/adc_cali_scheme.h>
+#include <driver/adc.h>
+#include <esp_adc_cal.h>
 #include "core/ble/ClientsManager.h"
 #include "esp_log.h"
 
@@ -76,8 +77,8 @@ private:
     static uint16_t lastVoltage_;
     static uint8_t lastPercent_;
     static bool lastCharging_;
-    static adc_oneshot_unit_handle_t adcHandle_;
-    static adc_cali_handle_t caliHandle_;
+    static bool calibrated_;
+    static esp_adc_cal_characteristics_t adcChars_;
     static TimerHandle_t readTimer_;
 
     /// Timer callback — reads voltage and sends BLE notification.
